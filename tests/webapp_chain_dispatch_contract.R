@@ -91,6 +91,20 @@ run_contract <- function() {
           identical(e$db_scalar(e$DB_CON, "SELECT req_id FROM step_attempts WHERE attempt_id=?",
             list(first$attempt_id %||% "")), "chain-ok"))
   if (!is.null(first)) {
+    due <- e$serve_request(NULL, list(target = "/api/exec/due", method = "GET", headers = list(), body = ""))
+    tok <- e$worker_token_issue(root, "fixture-worker", "default", note = "chain fixture")$token
+    claim <- e$serve_request(NULL, list(target = "/api/exec/claim", method = "POST",
+      headers = list("x-worker-token" = tok),
+      body = as.character(jsonlite::toJSON(list(id = first$id, worker_id = "fixture-worker",
+        pool_id = "default"), auto_unbox = TRUE))))
+    check("the worker receives the full dispatch identity and execution mode from due and claim",
+          due$code == 200L && claim$code == 200L && isTRUE(claim$body$ok) &&
+          length(due$body$items) == 1L &&
+          all(vapply(list(due$body$items[[1]], claim$body$item), function(it)
+            identical(it$id, first$id) && identical(it$attempt_id, first$attempt_id) &&
+            identical(it$version_id, first$version_id) && identical(it$run_id, first$run_id) &&
+            identical(it$executor_mode, first$executor_mode) &&
+            identical(it$run_dir, first$run_dir), TRUE)))
     # This is the coordinator's input after step/import accepts a result.
     next_stage <- e$rc_callback(list(session_id = chain_rec$id, req_id = "chain-ok",
       step = "first", status = "done", code = 0L), TRUE)

@@ -215,6 +215,7 @@ def handle(task, args):
             "step": step,
             "chain_id": chain,
             "status": "done" if ok else "failed",
+            "code": code,
             "exit_code": code,
             "log": tail,
             "worker_id": args.worker_id,
@@ -224,8 +225,11 @@ def handle(task, args):
             #   也写进了队列条目，但回写体里没有它，服务端只能按 req_id 去猜，
             #   猜不中就判 attempt_id_unknown，19 条「回写未被接受」就这么丢的。
             #   exec_id 一起带：服务端也要靠它定位是哪条任务在回写。
-            "attempt_id": str(task.get("attempt_id") or ""),
+            "attempt_id": att,
             "exec_id": tid,
+            "version_id": str(task.get("version_id") or ""),
+            "run_id": str(task.get("run_id") or ""),
+            "run_dir": str(task.get("run_dir") or ""),
         }
         res = CLIENT.step_import(imp)
         if not res.get("ok"):
