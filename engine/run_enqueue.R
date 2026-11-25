@@ -891,6 +891,16 @@ run_enqueue <- function(con = NULL, req = NULL, q = list(), body = list(), owner
           error = "这个环节已有一条不属于本流程的任务，请等原任务结束后再启动。")))
       }
 
+      # A concurrent click may have reused the existing queued or running task.
+      # Leave its writeback binding and notification untouched.
+      if (!is.null(enq) && !identical(as.character(enq$req_id %||% ""), stepRq)) {
+        return(send_json(con, 200, list(ok = TRUE, delegated = TRUE,
+          duplicate_dispatch = TRUE, exec_queued = TRUE, step = stepId,
+          req_id = as.character(enq$req_id %||% ""),
+          exec_id = as.character(enq$id %||% ""),
+          exec_status = as.character(enq$status %||% ""))))
+      }
+
       # ---- 质检闸门：上一步没过审 ----
       #   现在只作提示，不再拦本次点击：这次的作业由执行端按登记脚本跑，
       #   跑完照样带 mtime 回写，事后可核。拦下来只会让人点不动。

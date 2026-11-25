@@ -127,6 +127,16 @@ let sessionChanging = false;
 const recordTimers = new Set();
 const recordContext = () => recordGeneration;
 const recordCurrent = record => record === recordGeneration;
+if (window.AppShell && typeof window.AppShell.setRetryContext === 'function') {
+  window.AppShell.setRetryContext(() => {
+    if (sessionChanging || S.readonly) return null;
+    const generation = recordContext();
+    const analysisId = S.sessionId;
+    const session = S.topicId;
+    return {analysisId, session, isCurrent: () => recordCurrent(generation) && !sessionChanging
+      && !S.readonly && S.sessionId === analysisId && S.topicId === session};
+  });
+}
 async function recordAwait(promise, __recordScope) {
   try {
     const result = await promise;
@@ -151,6 +161,7 @@ function resetRecordState() {
   if (collapsedSaveTimer) clearTimeout(collapsedSaveTimer);
   collapsedSaveTimer = null;
   retryStepId = null; busyForce = null; refPickerGo = null; refPickStepId = '';
+  lastInvokeLabel = '';
   const keep = new Set(['env', 'identity', 'topicId', 'sessions', 'sessionId']);
   Object.keys(S).forEach(key => { if (!keep.has(key)) delete S[key]; });
   Object.assign(S, {
@@ -202,7 +213,7 @@ const API_BASE = (() => {
 })();
 const apiUrl = p => API_BASE + String(p == null ? '' : p).replace(/^\/+/, '');
 async function api(path, opts) {
-  if (sessionChanging && !/^\/api\/(sessions\/(new|switch|state)|place)(?:\?|$)/.test(path)) {
+  if (sessionChanging && !/^\/api\/(sessions(?:\/(new|switch|state))?|place)(?:\?|$)/.test(path)) {
     throw new Error('正在切换分析记录');
   }
   const __recordScope = recordContext();
@@ -578,14 +589,15 @@ async function loadSessionsState(targetId = null, bindCurrent = true) {
   try {
 
   let d = null;
-  const statePath = targetId
-    ? '/api/sessions/state?id=' + encodeURIComponent(String(targetId))
+  const selectedId = targetId || (bindCurrent ? S.sessionId : null);
+  const statePath = selectedId
+    ? '/api/sessions/state?id=' + encodeURIComponent(String(selectedId))
     : '/api/sessions/state';
-  const stateOpts = bindCurrent ? undefined : {recordBound: false};
-  try { d = await recordAwait(api(statePath, stateOpts), __recordScope); } catch (e) {
+  try { d = await recordAwait(api(statePath, {recordBound: false}), __recordScope); } catch (e) {
     if (!recordCurrent(__recordScope)) return;
- d = null; }
+  }
   if (!d || !d.ok) {
+    S.recordStateError = selectedId ? '暂时无法读取这份分析的识别结论，请刷新重试。' : '';
     // No current selection must not hide the list. A failed history read must
     // be distinguished from a genuinely empty history, without borrowing state.
     try {
@@ -602,8 +614,9 @@ async function loadSessionsState(targetId = null, bindCurrent = true) {
     return;
   }
   S.sessionsError = '';
+  S.recordStateError = '';
   S.sessions = arr(d.sessions);
-  S.sessionId = targetId || d.current || (d.session && d.session.id) || null;
+  S.sessionId = d.viewing_session_id || (d.session && d.session.id) || selectedId || d.current || null;
   const s = d.session || null;
   S.readonly = !!(s && s.can_write === false);
   S.collapsed = (s && s.collapsed) || {};
@@ -647,6 +660,7 @@ async function loadSessionsState(targetId = null, bindCurrent = true) {
     S.identified = false;
     S.identifyPhase = null;
     S.commitReq = null;
+    S.needsRemote = !!(s && s.mode === 'server');
   }
   if (s && s.place) {
     S.placeDraft = placeDraftFromServer(s.place);
@@ -3110,8 +3124,11 @@ function openSubFail(stepId, idx) {
     sheet('失败原因', '<div class="sh-p">没有这一环的记录。</div>');
     return;
   }
-  const note = String(sb.note || '');
-  // 环节没写 note 时，退到整步的日志里找报错行，别让人对着空白。
+  const task = currentStepTask(stepId, sg.exec_id);
+  const note = String(sb.note || '').trim();
+  const reason = note && note !== '回写为完成' ? note
+    : (sg.exec_status === 'failed' && sg.exec_error)
+      || (task && task.status === 'failed' && task.error) || '';
   const fallback = errKeyLines(String((sg && sg.log) || '')).join('\n');
   // 报错弹窗也按"这是什么 / 报错原文 / 同一阶段的日志"分层，
   //   和任务完成详情同一套版式 —— 她说这些弹窗"太简朴，看不出细节"。
@@ -3125,14 +3142,14 @@ function openSubFail(stepId, idx) {
     + '</div></div>';
 
   h += '<div class="dtsec"><div class="dtsec-t">报错原文</div>';
-  if (note) {
-    h += '<pre class="sh-log fail-log">' + esc(note) + '</pre>';
+  if (reason) {
+    h += '<pre class="sh-log fail-log">' + esc(reason) + '</pre>';
   } else {
     h += '<div class="sh-p">这一环没有写失败原因。点卡片上的「再报一次」，让它把报错取回来。</div>';
   }
   h += '</div>';
 
-  if (fallback && (!note || fallback !== note)) {
+  if (fallback && fallback !== reason) {
     h += '<div class="dtsec"><div class="dtsec-t">同一阶段日志里的报错行</div>'
       + '<pre class="sh-log">' + esc(fallback) + '</pre></div>';
   }
@@ -3886,12 +3903,16 @@ async function queryStep(id) {
   }
 }
 
-async function pokeFlow(stageId) {
+async function pokeFlow(stageId, originLabel = '查进度') {
   const __recordScope = recordContext();
   try {
 
-  await recordAwait(refreshExecTasks(), __recordScope);
+  await recordAwait(loadFlow(), __recordScope);
   const binding = stepNotificationBinding(stageId);
+  if (!binding.reqId) {
+    toast('这一步暂无可查询的任务编号。请查看步骤卡片和执行队列。', 'info');
+    return;
+  }
   const brief = '/api/brief?step=' + encodeURIComponent(stageId)
     + (S.sessionId ? '&session=' + encodeURIComponent(S.sessionId) : '')
     + (binding.reqId ? '&req=' + encodeURIComponent(binding.reqId) : '');
@@ -3908,7 +3929,8 @@ async function pokeFlow(stageId) {
   //   以前传默认 execute，prepare 会按执行任务去重建正文、申请回写凭据、
   //   抢占输出目录 —— 只为问一句进度，却把执行条件全备齐了。
   //   而且它要求助手手工回写，正好和执行端争同一份记录。
-  const r = await recordAwait(injectToSession(txt, function () {}, 'observe', binding, '查进度'), __recordScope);
+  const r = await recordAwait(injectToSession(txt, function () {}, 'observe', binding,
+    originLabel + ' · ' + (stepTitleCN(stageId) || stageId)), __recordScope);
   // 卡片上也留一句：toast 会消失，而人点完按钮还站在这一张卡上。
   const box = document.getElementById('stq-' + stageId);
   if (box) {
@@ -3917,12 +3939,12 @@ async function pokeFlow(stageId) {
     const handed = !!(r && (r.ok || r.relayed));
     box.innerHTML = handed
       ? '<span class="qok">已让它报一次（' + esc(fmtClock(new Date().toISOString()))
-        + (r && r.ok ? ' 送出' : ' 放进队列，我会取走') + '）。回写之后这一栏会自己变。</span>'
+        + (r && r.ok ? ' 已送入会话' : ' 已进入消息队列') + '）。进行中的作业可在执行队列查看。</span>'
       : '<span class="qbad">没送进会话：'
         + esc(String((r && (r.why || r.code)) || '通道没连上').replace(/[。．.]+$/, ''))
         + '。可等会话通道恢复后再点一次。</span>';
   }
-  if (r && (r.ok || r.relayed)) toast(r.ok ? '已让它报一次，回写后这一栏会自己变。' : '会话通道没连上，已放进队列，我会取走执行。', 'good');
+  if (r && (r.ok || r.relayed)) toast(r.ok ? '已向会话发送进度查询。' : '会话通道未连通，进度查询已存入消息队列。', 'info');
   else toast('没送进会话：' + String((r && (r.why || r.code)) || '通道没连上').replace(/[。．.]+$/, ''), 'bad');
 
   } catch (e) {
@@ -4220,6 +4242,14 @@ function renderRunCtl() {
   } else {
     h += '<div class="qidle">队列是空的，还没有派过任何任务。</div>';
   }
+  const lastFailure = S.sessionId && items.filter(t => t.session_id === S.sessionId && t.status === 'failed')
+    .sort((a, b) => String(b.finished_at || b.created_at || '').localeCompare(String(a.finished_at || a.created_at || '')))[0];
+  if (lastFailure) {
+    h += '<div class="qidle"><b>当前分析最近一次失败：</b>'
+      + esc(stepTitleCN(lastFailure.step) || lastFailure.step || '') + ' '
+      + esc(lastFailure.id || '')
+      + (lastFailure.error ? ' · ' + esc(lastFailure.error) : '') + '</div>';
+  }
 
   h += '<div class="qfoot">'
     + '<button class="btn btn-sm" data-exec-refresh="1">刷新队列</button>'
@@ -4504,9 +4534,9 @@ function renderDelegated() {
   const dl = currentDelegated();
   if (!dl) { host.innerHTML = ''; return; }
   if (dl.mode === 'observe' && dl.execId) {
-    const notice = dl.ok === true ? '观察通知已送达 Rachel。'
-      : dl.ok === false ? '观察通知未送达 Rachel；任务执行结果请看上方步骤状态，无需重复提交。'
-      : '正在通知 Rachel 查看任务；执行状态请看上方步骤。';
+    const notice = dl.ok === true ? '观察通知已送达当前会话。'
+      : dl.ok === false ? '观察通知未送达。' + (dl.why ? ' ' + dl.why : '') + ' 作业状态可在步骤卡片和执行队列查看。'
+      : '正在向当前会话发送观察通知。作业状态可在步骤卡片和执行队列查看。';
     host.innerHTML = '<div class="rz warn"><span class="mk">i</span><span>' + esc(notice) + '</span></div>';
     return;
   }
@@ -4720,13 +4750,14 @@ async function runStep(id, reqNote, force, extra = {}) {
   const __recordScope = recordContext();
   try {
 
-  if (S.running && !S.needsRemote && !(extra && extra.overwrite)) return;
+  const originLabel = extra.originLabel || takeInvokeLabel();
+  if (S.running && !S.needsRemote && !extra.overwrite) return;
   // 同一步骤已有任务在跑：先说清后果，别让人以为只是排个队。
   //   这条对「按原样重跑」和「交给助手去跑」都生效 ——
   //   两个按钮都会真的提交一次作业，覆盖风险和入口无关。
   const busy = busyOf(id);
-  if (busy && !force && !(extra && extra.overwrite)) {
-    showBusySheet(id, busy, function () { runStep(id, reqNote, true); });
+  if (busy && !S.needsRemote && !force && !extra.overwrite) {
+    showBusySheet(id, busy, function () { runStep(id, reqNote, true, {...extra, originLabel}); });
     return;
   }
   S.running = true; S.step = id; S.code = null; S.lastLogLen = 0;
@@ -4744,27 +4775,42 @@ async function runStep(id, reqNote, force, extra = {}) {
     //   混在一起事后分不清哪句是当初定的。
     if (reqNote && String(reqNote).trim()) body.req_note = String(reqNote).trim();
     const r = await recordAwait(postJSON('/api/run', body), __recordScope);
+    if (r && r.duplicate_dispatch) {
+      S.running = false;
+      renderRun();
+      toast('已找到这一步的作业' + (r.exec_id ? '（' + r.exec_id + '）' : '') + '，请在执行队列查看。', 'info');
+      startPolling();
+      return;
+    }
     // 服务器模式：这一步不由本机执行，服务端把它变成一条任务交回来。
     //   这里必须真的发出去 —— 只显示"请到助手那边跑"等于按钮是死的，
     //   用户点了只会看到一条报错。发出去之后状态才从"空闲"变成"已交给助手"。
     if (r && r.delegated) {
-      S.delegated = { sessionId: S.sessionId, step: id, title: r.title || id, at: Date.now(), ok: null, why: '',
-                      text: r.instruction || '', mode: r.mode || 'execute',
-                      execId: r.exec_id || '', execJob: r.exec_job || '' };
+      const delegated = {sessionId: S.sessionId, step: id, title: r.title || id, at: Date.now(), ok: null, why: '',
+        text: r.instruction || '', mode: r.mode || 'execute', execQueued: !!r.exec_queued,
+        execId: r.exec_id || '', execJob: r.exec_job || ''};
+      S.delegated = delegated;
+      if (delegated.execQueued) {
+        S.running = false;
+        startPolling();
+      }
       renderRun();
       // 进会话的只用短的那一段：长指令会超过通道载荷上限，被平台判无效。
       //   短的那段带着 /api/brief 的地址，助手按地址取全文，一条不落地照做。
       //   已入队时那段是"只观察"的，purpose 一起带过去，队列里也留得下标记。
       const sendTxt = r.session_text || r.instruction || '';
       const purpose = r.mode === 'observe' ? 'observe' : 'execute';
-      const res = await recordAwait(injectToSession(sendTxt, function () {}, purpose, {step:id, reqId:r.req_id || r.request_id || ''}, takeInvokeLabel() || stepTitleCN(id) || '跑这一步'), __recordScope);
+      const stepLabel = stepTitleCN(id) || (id === 'all' ? '一键全流程' : r.title || id);
+      const title = originLabel && originLabel !== stepLabel ? originLabel + ' · ' + stepLabel : stepLabel;
+      const res = await recordAwait(injectToSession(sendTxt, function () {}, purpose,
+        {step:id, reqId:r.req_id || r.request_id || ''}, title), __recordScope);
       // 这一步的作业在服务端就已经排进执行队列了（r.delegated 本身就是"已入队"）。
       //   注入会话只是顺带通知助手，不是被执行的前提。
       //   以前把注入结果当成败判据：会话通道一断，页面就报"没送进"，人以为活没派出去，
       //   实际作业已经躺在队列里、执行端每分钟都会来领。
-      S.delegated.ok = !!res.ok;
-      S.delegated.execQueued = !!r.exec_queued;
-      S.delegated.why = res.ok ? '' : (res.why || res.code || '');
+      if (S.delegated !== delegated) return;
+      delegated.ok = !!res.ok;
+      delegated.why = res.ok ? '' : (res.why || res.code || '');
       // 文案必须说清"谁在跑"：作业已入队时，跑的是执行端，不是助手。
       //   以前无论哪种情况都说"已交给助手"，于是人在会话里看到助手又要跑一遍，
       //   以为这是正常的第二步 —— 实际那是重复提交。
@@ -4779,7 +4825,7 @@ async function runStep(id, reqNote, force, extra = {}) {
         toast('指令没能送进会话：' + String(res.why || res.code || '通道没连上').replace(/[。．.]+$/, '')
           + (res.queued ? '。已入队，每小时自动重试，回写后停止。' : '。原文在下面，可自己发。'), 'bad');
       }
-      S.running = false;
+      if (!delegated.execQueued) S.running = false;
       renderRun();
       // 交接出去之后继续盯着：助手回写的那一刻，这一栏要自己变。
       //   这里只是"等结果"，不是"在跑" —— 所以 pollStatus 对服务器模式走另一条判据。
@@ -7683,7 +7729,10 @@ async function renderIdentify() {
   // 判据是「这一次点过保存并识别」，不是「本机记没记住运行目录」。
   //   服务器模式下运行目录在服务器上，本机 state 里是空的；
   //   按 S.runDir 判会让整块识别结论直接消失 —— 点了保存却什么都没出现。
-  if (!S.identified) { host.innerHTML = ''; return; }
+  if (!S.identified) {
+    host.innerHTML = S.recordStateError ? '<div class="small">' + esc(S.recordStateError) + '</div>' : '';
+    return;
+  }
   // 服务器模式下，「保存并识别」只是把活交给助手，识别结论要等它写回才有。
   //   这段时间只显示"在等什么"。绝不在这里下结论：本机读不到服务器的内存和包，
   //   拿这份空缺当"识别不了"是错的 —— 那只是"还没开始"。
@@ -7692,14 +7741,14 @@ async function renderIdentify() {
     return;
   }
 
-  let env = null, dec = null, lib = null;
+  let env = S.sessionId ? S.envCheck || null : null, dec = null, lib = null;
   let envStale = false, staleEnv = null, staleNote = '';
   // 先看「这一份记录自己识别出了什么」。
   //   多份记录并存之后，这个才是正确的问题 —— /api/envcheck 回答的是
   //   「最近一次识别是什么」，切到旧记录时会显示新记录的数字。
   //   记录里有结论就用它；没有才回退去问 /api/envcheck（老数据/本机模式）。
-  let fromSession = false;
-  if (S.sessionId) {
+  let fromSession = !!env;
+  if (S.sessionId && !fromSession) {
     try {
       const ss = await recordAwait(getJSON('/api/sessions/state?id=' + encodeURIComponent(S.sessionId)), __recordScope);
       const ident = ss && ss.session && ss.session.identify;
@@ -7717,7 +7766,7 @@ async function renderIdentify() {
   //   只认「属于最近一次保存并识别」的结果。
   //   不属于的话，它只是上一轮跑出来的旧数据 —— 拿来当结论显示，
   //   会让人以为刚点的那次已经生效了，而助手可能根本还没动。
-  if (!fromSession) {
+  if (!fromSession && (!S.sessionId || !S.needsRemote)) {
     try {
       const ec = await recordAwait(getJSON('/api/envcheck'), __recordScope);
       envStale = !!ec.stale || (!!S.commitReq && !ecIsFresh(ec));
@@ -8843,10 +8892,15 @@ function composeSend(inst, text, finish) {
    判据和外壳不一致（任务通道 isConnected() 恒为真那次，就把本来能用的
    注入通道整个绕过去了）；而且送失败之后只剩"请自己复制"。
    调用点不用改：签名与返回结构保持原样。 */
+function currentStepTask(step, execId) {
+  if (!S.sessionId) return null;
+  return arr(S.execTasks).find(x => x.step === step && x.session_id === S.sessionId
+    && (!execId || x.id === execId)) || null;
+}
+
 function stepNotificationBinding(step) {
-  const sg = arr(S.flow && S.flow.stages).find(x => x.id === step);
-  const ex = sg && sg.exec_id ? arr(S.execTasks).find(x => x.id === sg.exec_id && x.step === step && x.session_id === S.sessionId) : null;
-  if (sg && sg.exec_id) return {step: step, reqId: ex && ex.req_id || ''};
+  const sg = stageOf(step);
+  if (sg && sg.exec_id) return {step: step, reqId: sg.exec_req_id || ''};
   const rs = (S.remoteSteps || {})[step];
   return {step: step, reqId: rs && rs.req_id || ''};
 }
@@ -9266,7 +9320,7 @@ document.addEventListener('click', async function (ev) {
   const sq = t.closest('[data-stepq]');
   if (sq) { queryStep(sq.getAttribute('data-stepq')); return; }
   const sp = t.closest('[data-steppoke]');
-  if (sp) { pokeFlow(sp.getAttribute('data-steppoke')); return; }
+  if (sp) { pokeFlow(sp.getAttribute('data-steppoke'), '再报一次'); return; }
   const sd = t.closest('[data-stepdetail]');
   if (sd) { openStepDetail(sd.getAttribute('data-stepdetail')); return; }
   const sf = t.closest('[data-subfail]');
