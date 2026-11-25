@@ -19,10 +19,8 @@
   'use strict';
 
   var RETRY_MS = 3600 * 1000;   // 每小时复查一次（与后端 INJECT_RETRY_SECS 对齐）
-  // 补发冷却：页面加载、切标签、窗口获得焦点都会触发 retryDue，
-  //   冷却窗口内的重复触发直接忽略，避免"一刷新就注入一条"。
-  var RETRY_COOLDOWN_MS = 5 * 60 * 1000;
-  var lastRetryAt = 0;
+  var getRetryContext = function () { return null; };
+  var retrying = false;
   var MAX_ATTEMPTS = 6;         // 与后端 MAX_INJECT_ATTEMPTS 对齐
   var SEND_WAIT_MS = 8000;      // 单次投递最多等这么久
 
@@ -489,31 +487,36 @@
 
   /* ---------------- 每小时复查 + 补发 ---------------- */
 
+  function normalizeTopic(topic) {
+    var value = String(topic || '').trim();
+    return value.indexOf('grp_') === 0 ? 'cc_group_' + value : value;
+  }
+
   function retryDue() {
-    if (inflight) return Promise.resolve(null);
-    // 冷却窗口：页面刷新、切标签、窗口重新获得焦点都会调到这里。
-    //   原来每次调用都直接补发，而补发走的 prepare 会生成新的指令包，
-    //   于是一刷新就往会话里注入一条（实测 8 分钟 6 条同一件事）。
-    //   现在同一进程内 5 分钟内只补发一次；而且是否真有该补发的，
-    //   由后端 inject_due 判定（已送达的条目不再自动重发）。
-    var nowMs = Date.now();
-    if (lastRetryAt && nowMs - lastRetryAt < RETRY_COOLDOWN_MS) return Promise.resolve(null);
-    lastRetryAt = nowMs;
+    var ctx = getRetryContext();
+    if (inflight || retrying || !ctx || !ctx.analysisId || !ctx.session) return Promise.resolve(null);
+    retrying = true;
     return getJSON('api/inject/due').then(function (r) {
-      var items = (r && r.items) || [];
-      if (!items.length) return null;
-      // 只补发最早的一条，避免一次往会话里灌一堆。
-      var it = items[0];
+      if (inflight || !ctx.isCurrent()) return null;
+      var it = ((r && r.items) || []).find(function (item) {
+        return (item.analysis_id || item.session_id) === ctx.analysisId
+          && normalizeTopic(item.session) === normalizeTopic(ctx.session);
+      });
+      if (!it) return null;
       if (Number(it.attempts || 0) >= MAX_ATTEMPTS) {
         return reportAttempt(it.id, false, 'max_attempts', '已达重试上限，需要人工处理');
       }
-      return prepareAndSend('', retryMeta(it)).then(function (res) {
+      var meta = retryMeta(it);
+      meta.isCurrent = function () { return !inflight && ctx.isCurrent(); };
+      return prepareAndSend('', meta).then(function (res) {
+        if (res.code === 'record_changing') return res;
         return reportAttempt(it.id, res.ok, res.code, res.why).then(function () {
           refreshStatus();
           return res;
         });
       });
-    }).catch(function (e) { return failure(e, 'retry_due'); });
+    }).catch(function (e) { return failure(e, 'retry_due'); })
+      .finally(function () { retrying = false; });
   }
 
   // 只把队列概况取回来存在内存里；界面上不再有对应按钮和面板。
@@ -528,16 +531,13 @@
   function start() {
     if (started) return;
     started = true;
-    // 三个触发点都要：定时、页面重新可见、窗口获得焦点。
-    //   只靠定时的话，浏览器把后台标签页的定时器降频甚至冻结，
-    //   一小时一次就成了不定时。
+    // 打开、刷新和回到页面都只读状态，只有定时检查才会补发。
     timer = setInterval(function () { retryDue(); refreshStatus(); }, RETRY_MS);
     document.addEventListener('visibilitychange', function () {
-      if (document.visibilityState === 'visible') { retryDue(); refreshStatus(); }
+      if (document.visibilityState === 'visible') refreshStatus();
     });
-    window.addEventListener('focus', function () { retryDue(); refreshStatus(); });
-    // 启动就查一次：关掉很久再打开，积压的那几条要立刻补上，不等一小时。
-    refreshStatus().then(function () { return retryDue(); }).then(refreshStatus);
+    window.addEventListener('focus', refreshStatus);
+    refreshStatus();
     // 打开就自报一次现场：通道通不通、父页是谁。
     //   为什么不等失败才报：失败时人未必点自检，日志就永远是空的；
     //   而"打开这一刻通道是什么状态"才是判断问题的关键证据。
@@ -553,6 +553,7 @@
     diag: function () { return channelReport(); },
     reportDiag: reportDiag,
     retryDue: retryDue,
+    setRetryContext: function (read) { getRetryContext = read; },
     refreshStatus: refreshStatus,
     status: function () { return lastStatus; },
     channels: function () {

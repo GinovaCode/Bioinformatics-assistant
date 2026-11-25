@@ -1384,12 +1384,13 @@ flow_exec_state <- function(exNow, exFail, rec) {
   }
   if (is.null(pick)) {
     return(list(status = if (is.null(rec)) "todo" else "",
-                exec_id = NULL, exec_status = NULL,
+                exec_id = NULL, exec_req_id = NULL, exec_status = NULL,
                 exec_job = NULL, exec_last_seen = NULL, exec_error = NULL))
   }
   err <- as.character(pick$error %||% "")
   list(status = status,
        exec_id = as.character(pick$id %||% ""),
+       exec_req_id = as.character(pick$req_id %||% ""),
        exec_status = status,
        exec_job = as.character(pick$job_id %||% ""),
        exec_last_seen = as.character(pick$last_seen %||% ""),
@@ -9296,6 +9297,7 @@ serve_request <- function(con, req) {
         # 队列侧的信息单独给出一份，前端据此显示"执行端正在跑（作业名）"，
         #   而不是笼统地写"已交给助手"。
         exec_id = if (is.null(exPick)) NULL else as.character(exPick$exec_id %||% ""),
+        exec_req_id = if (is.null(exPick)) NULL else (exPick$exec_req_id %||% NULL),
         exec_status = if (is.null(exPick)) NULL else as.character(exPick$exec_status %||% ""),
         exec_job = if (is.null(exPick)) NULL else as.character(exPick$exec_job %||% ""),
         # 执行端原文错误：页面照原样显示，别让"交接未确认"掩盖一次明确拒绝。

@@ -6,12 +6,12 @@ const test = require('node:test');
 const path = require('node:path');
 const source = process.env.FRONTEND_SOURCE || path.join(__dirname, '../public/app.20261107fix1.js');
 function deferred() { let resolve; const promise = new Promise(r => { resolve = r; }); return {promise, resolve}; }
-function harness() {
+function harness(appSource = source) {
   const elements = new Map(), calls = [], timers = new Map(); let timerId = 0;
   const element = id => { if (!elements.has(id)) elements.set(id, {innerHTML:'',textContent:'',style:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},querySelectorAll(){return []},querySelector(){return null},getAttribute(){return ''},appendChild(){},remove(){}}); return elements.get(id); };
   let backend = async url => url.includes('/sessions/switch') || url.includes('/sessions/new') ? {ok:true,session:{id:'B'}} : url.includes('/sessions/state') ? {ok:true,current:'B',session:{id:'B',mode:'server',run_dir:'/B',identify:{mode:'server',result:{}}},sessions:[]} : url.includes('/place') ? {ok:true,mode:'server',server:{}} : {};
   const c = vm.createContext({console, URL, Date, JSON, Promise, AbortController, location:{href:'http://local/',pathname:'/'},navigator:{},window:{addEventListener(){}},document:{currentScript:null,addEventListener(){},querySelector:element,querySelectorAll(){return []},getElementById:id=>element('#'+id),createElement(){return element('new')}},prompt:()=>'',setTimeout(fn,ms){ const id=++timerId;timers.set(id,{fn,ms});return id;},setInterval(fn,ms){const id=++timerId;timers.set(id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),clearInterval:id=>timers.delete(id),fetch:async (url,opts)=>{calls.push({url,opts});let body=await backend(url,opts);if (url.includes('/sessions/switch') && !Object.keys(body).length) body={ok:true,session:{id:JSON.parse(opts.body).id}};if (url.includes('/sessions/new') && !Object.keys(body).length) body={ok:true,session:{id:'B'}};return {ok:true,text:async()=>JSON.stringify(body)};}});
-  vm.runInContext(fs.readFileSync(source,'utf8').replace(/boot\(\);\s*$/, ''), c);
+  vm.runInContext(fs.readFileSync(appSource,'utf8').replace(/boot\(\);\s*$/, ''), c);
   const run = s => vm.runInContext(s,c);
   run("S.sessionId='A'; S.runDir='/A'; S.needsRemote=true; toast=()=>{}; renderAll=()=>{}; renderPlace=()=>{}; renderSessionsBar=()=>{}; setStageVisible=()=>{}; renderFlow=()=>{}; renderRunCtl=()=>{};");
   return {c,run,calls,timers,e:element,setBackend:fn=>{backend=fn}};
@@ -83,4 +83,43 @@ test('late run-directory response does not rehydrate the wrong record',async()=>
 });
 test('read session query and write session_id bind explicitly without replacing supplied targets',async()=>{
  const h=harness();h.setBackend(async()=>({ok:true}));await h.run("getJSON('/api/flow'); postJSON('/api/run',{step:'pipeline1'}); getJSON('/api/variants?session=OTHER')");await new Promise(r=>setImmediate(r));assert.match(h.calls[0].url,/session=A/);assert.equal(JSON.parse(h.calls[1].opts.body).session_id,'A');assert.match(h.calls[2].url,/session=OTHER/);
+});
+
+
+test('an explicit historical record keeps its stored result when ancillary reads fail', async () => {
+  const h = harness(path.join(__dirname, '../public/app.js'));
+  h.setBackend(async url => {
+    if (url.includes('/api/sessions/state')) return {
+      ok: true, current: 'A', viewing_session_id: 'B', sessions: [], identify_status: 'ready',
+      session: {id: 'B', mode: 'server', identify: {req_id: 'identify-B', result: {marker: 'B'}}}
+    };
+    throw new Error('ancillary read failed');
+  });
+  await h.run("loadSessionsState('B', false)");
+  await h.run('renderIdentify()');
+  assert.equal(h.run('S.sessionId'), 'B');
+  assert.equal(h.run('S.envCheck.marker'), 'B');
+  assert.equal(h.calls.filter(x => x.url.includes('/api/sessions/state')).length, 1);
+  assert.equal(h.calls.some(x => x.url.includes('/api/envcheck')), false);
+});
+
+test('a reused execution task does not send a second chat notification', async () => {
+  const h = harness(path.join(__dirname, '../public/app.js'));
+  h.run("renderRun=()=>{}; startPolling=()=>{}; injectToSession=()=>{throw new Error('duplicate notification')}");
+  h.setBackend(async () => ({ok:true, delegated:true, duplicate_dispatch:true, exec_id:'ex-existing'}));
+  await h.run("runStep('doublet')");
+  assert.equal(h.run('S.running'), false);
+  assert.equal(h.run('S.delegated'), null);
+  assert.equal(h.calls.filter(x => x.url.includes('/api/run')).length, 1);
+});
+
+test('step status inquiry binds to the selected job and does not submit a run', async () => {
+  const h = harness(path.join(__dirname, '../public/app.js'));
+  h.run("injectToSession = (_text, _state, purpose, binding, title) => { window.sent = {purpose, binding, title}; return Promise.resolve({ok:true}); }");
+  h.setBackend(async () => ({stages:[{id:'doublet', title:'逐样本去双与质控', exec_id:'ex-A', exec_req_id:'req-A'}]}));
+  await h.run("pokeFlow('doublet', '再报一次')");
+  assert.equal(h.run('window.sent.purpose'), 'observe');
+  assert.equal(h.run('window.sent.binding.reqId'), 'req-A');
+  assert.equal(h.run('window.sent.title'), '再报一次 · 逐样本去双与质控');
+  assert.equal(h.calls.some(x => x.url.includes('/api/run')), false);
 });
